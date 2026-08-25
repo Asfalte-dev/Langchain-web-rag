@@ -11,3 +11,16 @@ ENV/
 
 #DB
 chroma_db/*
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cache et configuration des outils
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
