@@ -147,7 +147,7 @@ if st.session_state.vectorstore is not None:
                 with st.spinner("Generating your answer..."):
                     retriever = st.session_state.vectorstore.as_retriever()
                     # multi query
-                    multi_template = """You are an AI language model assistant. Your task is to generate 1 - 5 different sub questions OR alternate versions of the given user question to retrieve relevant documents from a vector database.
+                    multi_template = """You are an AI language model assistant that helps answering questions about GregTech:NewHorizons. Your task is to generate 1 - 5 different sub questions OR alternate versions of the given user question to retrieve relevant documents from a vector database.
 
                                         By generating multiple versions of the user question,
                                         your goal is to help the user overcome some of the limitations
@@ -184,7 +184,35 @@ if st.session_state.vectorstore is not None:
                         | StrOutputParser() 
                         | parse_questions
                     )
+                    llm = ChatOpenAI(model="gpt-5.4")
 
+                    # RECURSIVE RAG DECOMPOSITON
+
+                    template = """Here is the question you need to answer:
+
+                                \n --- \n {question} \n --- \n
+
+                                Here is any available background question + answer pairs:
+
+                                \n --- \n {q_a_pairs} \n --- \n
+
+                                Here is additional context relevant to the question: 
+
+                                \n --- \n {context} \n --- \n
+
+                                Use the above context and any background question + answer pairs to answer the question: \n {question}
+                                """
+
+                    decomposition_prompt = ChatPromptTemplate.from_template(template)
+
+                    decompostion_chain = (
+                        decomposition_prompt
+                        | llm
+                        | StrOutputParser()
+                    )
+
+                    # RAG FUSION
+                    
                     def reciprocal_rank_fusion(results: list[list[Document]], k=60) -> list[Document]:
                         """Reciprocal_rank_fusion taht takes multiple lists of ranked documents
                             and an optional parameter k used in the RRF formula"""
@@ -213,30 +241,71 @@ if st.session_state.vectorstore is not None:
                         ]
 
                         return reranked_results
-                        
-                    #this chain will generate multiple queries from the original question, retreive documents for each query, and then make a union of all retreived documents to have a more complete context for the final answer generation
-                    retrieval_chain = generate_queries | retriever.map() | reciprocal_rank_fusion
 
                     def format_docs(docs): #Format the retreived documents to have a better prompt for the final answer generation
                         return "\n\n".join(doc.page_content for doc in docs)
+                    
+                    def format_qa_pair(question, answer):
+                        """Format Q and A pair"""
+                        return f"Question: {question}\nAnswer: {answer}"
 
+                    def recursively_answer(data:dict) -> dict:
+                        original_question = data["question"]
+
+                        #Parse_question, is executed inside generate_queries
+                        questions = generate_queries.invoke({
+                            "question": original_question
+                        })
+
+                        qa_pairs = []
+                        retrieved_results = []
+
+                        for subquestion in questions:
+                            #Retrieve documents specifically for this subquestion
+                            docs = retriever.invoke(subquestion)
+                            retrieved_results.append(docs)
+
+                            answer = decompostion_chain.invoke({
+                                "question": subquestion,
+                                "q_a_pairs": "\n\n---\n\n".join(qa_pairs),
+                                "context": format_docs(docs),
+                            })
+
+                            qa_pairs.append(
+                                format_qa_pair(subquestion, answer)
+                            )
+
+                        #Fuse documents retrieved for all subquestions
+                        fused_docs = reciprocal_rank_fusion(retrieved_results)
+
+                        return {
+                            "docs": fused_docs,
+                            "q_a_pairs": "\n\n---\n\n".join(qa_pairs),
+                        }
                     # Full rag chain with multiple queries and final answer generation
-                    template = """Answer the following question based on this context and the retrieved documents. If you don't know the answer, say you don't know. Be concise and precise in your answer.:
-
-                    Context: {context}
-
-                    Question: {question}
-                    """
+                    template = """Answer the original question using the information below.
+        
+                                Original question:
+                                {question}
+                                
+                                Subquestion answers:
+                                {q_a_pairs}
+                                
+                                Retrieved context:
+                                {context}
+                                """
 
                     prompt= ChatPromptTemplate.from_template(template)
-                    llm = ChatOpenAI(model="gpt-5.4")
 
                     def build_answer_input(data):
-                        return {
-                            "context": format_docs(data["docs"]),
-                            "question": data["question"],
-                        }
+                        recursive_result = data["recursive"]
 
+                        return {
+                            "question": data["question"],
+                            "context": format_docs(recursive_result["docs"]),
+                            "q_a_pairs": recursive_result["q_a_pairs"],
+                        }
+                    
                     answer_chain = (
                         RunnableLambda(
                             build_answer_input,
@@ -246,10 +315,13 @@ if st.session_state.vectorstore is not None:
                         | llm
                         | StrOutputParser()
                     )
-                    
+
+
+                    recursive_chain = RunnableLambda(recursively_answer)
+
                     full_rag_chain = ( 
                         #Adds retieved documents to the original input dictionnary
-                        RunnablePassthrough.assign(docs=retrieval_chain)
+                        RunnablePassthrough.assign(recursive=recursive_chain)
                         #Uses those same documents to produce the answer
                         | RunnablePassthrough.assign(answer=answer_chain)
                     ).with_config({"run_name": "MultiQueryRAG"})
@@ -259,7 +331,7 @@ if st.session_state.vectorstore is not None:
                     })
 
                     response = result["answer"]
-                    docs = result["docs"]
+                    docs = result["recursive"]["docs"]
                     
                     st.session_state.last_response = response
                     st.session_state.last_context = docs
