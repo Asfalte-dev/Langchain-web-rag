@@ -1,0 +1,13 @@
+# Secrets et configuration locale
+.env
+.env.*
+!.env.example
+
+# Environnements virtuels Python
+venv/
+.venv/
+env/
+ENV/
+
+#DB
+chroma_db/*

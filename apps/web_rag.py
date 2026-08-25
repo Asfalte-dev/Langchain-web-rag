@@ -1,3 +1,4 @@
+from operator import itemgetter
 import os
 from xml.dom.minidom import Document
 import streamlit as st
@@ -6,9 +7,14 @@ from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import InMemoryVectorStore
 from langsmith import Client
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.load import dumps, loads
+import bs4
 import tempfile
+from langchain_community.vectorstores import Chroma
+
 
 
 st.set_page_config(
@@ -19,10 +25,17 @@ st.title("Web Rag")
 
 #Load environnement variable
 load_dotenv()
-api_key = os.environ.get("OPENAI_API_KEY")
+openai_api_key = os.environ.get("OPENAI_API_KEY")
+langchain_tracing_v2 = os.environ.get("LANGCHAIN_TRACING_V2")
+langchain_endpoint = os.environ.get("LANGCHAIN_ENDPOINT")
+langchain_api_key = os.environ.get("LANGCHAIN_API_KEY")
 
-if not api_key:
-    st.error("OPEN_API_KEY is not set in the environnement variables")
+if not openai_api_key:
+    st.error("OPENAI_API_KEY is not set in the environnement variables")
+    st.stop()
+
+if not langchain_api_key:
+    st.error("LANGCHAIN_API_KEY is not set in the environnement variables")
     st.stop()
 
 if 'vectorstore' not in st.session_state:
@@ -43,7 +56,14 @@ if input_mode == "Website URL":
     #Indexing pipeline
     if st.button("Initialize RAG system"):
         with st.spinner("Loading and processing the data..."):
-            loader = WebBaseLoader(url)
+            loader = WebBaseLoader(
+                web_paths=(url,),
+                bs_kwargs=dict( #bs_kwargs are the arguments for BeautifulSoup to parse the webpage and extract relevant content
+                    parse_only=bs4.SoupStrainer(
+                        ["article", "main", "h1", "h2", "p"] #Only keep relevant tag to avoid noise in the vector DB
+                    )
+                )
+            )
             documents = loader.load()
             documents.extend(documents)
 else:
@@ -75,26 +95,47 @@ else:
 
 #Embedding and store iside the vector DB
 if documents:
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, 
-                                                chunk_overlap=200, 
-                                                separators=["\n\n", "\n", " ", ""])
+    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        model_name="text-embedding-3-large",
+        chunk_size=300, #Size of each chunk in tokens
+        chunk_overlap=50 #Overlap between chunks to maintain context
+        )
     chunks = text_splitter.split_documents(documents)
 
     embeddings = OpenAIEmbeddings(model="text-embedding-3-large") #OpenAI embedding model
-    st.session_state.vectorstore = InMemoryVectorStore.from_documents(chunks, embeddings)
+    st.session_state.vectorstore = Chroma(collection_name="web_rag_collection", 
+                                                         embedding_function=embeddings,
+                                                         persist_directory="./chroma_db") #Store chunks in Chroma vector DB & persist it on disk for future use
+    
+    ids= [ #Generate unique ids for each chunk based on source and index to avoid duplicates in the vector DB
+        f"{chunk.metadata.get('source', 'unknown_source')}_{i}" 
+        for i, chunk in enumerate(chunks)
+    ]
+    existing = st.session_state.vectorstore.get(ids=ids) #“Out of these IDs, which ones are already stored in the database?”
+    existing_ids = set(existing["ids"])
+    
+    new_chunks = []
+    new_ids = []
+
+    for chunk, doc_id in zip(chunks, ids): #If this chunk’s ID is not already in Chroma, keep it.
+        if doc_id not in existing_ids:
+            new_chunks.append(chunk)
+            new_ids.append(doc_id)
+
+    if new_chunks: #Only add new chunks to the vector DB to avoid duplicates and save storage space
+            st.session_state.vectorstore.add_documents(
+            documents=new_chunks,
+            ids=new_ids
+        )
+    else:
+        st.info("This URL or document is already indexed.")
+
     st.success("Rag system is initialized !")
 
 #If indexing worked then allow to ask question
 if st.session_state.vectorstore is not None:
-    llm = ChatOpenAI(model="gpt-5.4")
     
-    client = Client()
-    prompt = client.pull_prompt("rlm/rag-prompt:50442af1")
-
-    chain = prompt | llm
-
     col1, col2 = st.columns(2)
-
     #Ask a question pipeline
     with col1:
         st.subheader("Ask a Question")
@@ -104,15 +145,83 @@ if st.session_state.vectorstore is not None:
             if question:
                 with st.spinner("Generating your answer..."):
                     retriever = st.session_state.vectorstore.as_retriever()
-                    docs = retriever.invoke(question)
-                    docs_content = "\n\n".join(doc.page_content for doc in docs)
+                    # multi query
+                    multi_template = """You are an AI language model assistant. Your task is to generate 1 - 5 different sub questions OR alternate versions of the given user question to retrieve relevant documents from a vector database.
 
-                    response = chain.invoke({
-                        "question": question,
-                        "context": docs_content
-                        })
+                                        By generating multiple versions of the user question,
+                                        your goal is to help the user overcome some of the limitations
+                                        of distance-based similarity search.
+
+                                        By generating sub questions, you can break down questions that refer to multiple concepts into distinct questions. This will help you get the relevant documents for constructing a final answer
+
+                                        If multiple concepts are present in the question, you should break into sub questions, with one question for each concept
+
+                                        Provide these alternative questions separated by newlines between XML tags. For example:
+
+                                        <questions>
+                                        - Question 1
+                                        - Question 2
+                                        - Question 3
+                                        </questions>
+
+                                        Original question: {question}"""
+                    prompt_perspectives = ChatPromptTemplate.from_template(multi_template)
+
+                    def parse_questions(text: str): #Parse the output of the multi query prompt to extract the generated questions, remove empty lines and the XML tags
+                        return [
+                            line.strip().lstrip("- ").strip()
+                            for line in text.splitlines()
+                            if line.strip()
+                            and not line.strip().startswith("<")
+                            and not line.strip().endswith(">")
+                        ]
                     
-                    st.session_state.last_response = response.content
+                    generate_queries = ( #This pipeline will generate multiple queries from the original question to retrieve more relevant documents from the vector DB and improve the final answer quality
+                        prompt_perspectives 
+                        | ChatOpenAI(temperature=0) 
+                        | StrOutputParser() 
+                        | parse_questions
+                    )
+
+                    def get_unique_union(documents: list[list]):
+                        #Union of retreived documents from multiple queries
+                        #Flatten the list of lists, and convert each documents to string
+                        flattened_docs = [dumps(doc) for sublist in documents for doc in sublist]
+                        #Get unique documents
+                        unique_docs = list(set(flattened_docs))
+                        #return documents in their original format
+                        return [loads(doc) for doc in unique_docs]
+                    #this chain will generate multiple queries from the original question, retreive documents for each query, and then make a union of all retreived documents to have a more complete context for the final answer generation
+                    retrieval_chain = generate_queries | retriever.map() | get_unique_union
+
+                    def format_docs(docs): #Format the retreived documents to have a better prompt for the final answer generation
+                        return "\n\n".join(doc.page_content for doc in docs)
+                    
+                    docs = retrieval_chain.invoke({"question": question})
+                    context = format_docs(docs)
+
+                    # Full rag chain with multiple queries and final answer generation
+                    template = """Answer the following question based on this context and the retrieved documents. If you don't know the answer, say you don't know. Be concise and precise in your answer.:
+
+                    {context}
+
+                    Question: {question}
+                    """
+
+                    prompt= ChatPromptTemplate.from_template(template)
+                    llm = ChatOpenAI(model="gpt-5.4")
+                    
+                    final_rag_chain = ( 
+                        prompt
+                        | llm
+                        | StrOutputParser()
+                    )
+                    
+                    response = final_rag_chain.invoke({"question": question, 
+                                                       "context": context
+                                                       })
+
+                    st.session_state.last_response = response
                     st.session_state.last_context = docs
             else:
                 st.warning("Please enter a question:")
