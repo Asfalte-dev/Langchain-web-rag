@@ -11,6 +11,7 @@ from langsmith import Client
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.load import dumps, loads
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 import bs4
 import tempfile
 from langchain_community.vectorstores import Chroma
@@ -105,7 +106,7 @@ if documents:
     embeddings = OpenAIEmbeddings(model="text-embedding-3-large") #OpenAI embedding model
     st.session_state.vectorstore = Chroma(collection_name="web_rag_collection", 
                                                          embedding_function=embeddings,
-                                                         persist_directory="./chroma_db") #Store chunks in Chroma vector DB & persist it on disk for future use
+                                                         persist_directory="../chroma_db") #Store chunks in Chroma vector DB & persist it on disk for future use
     
     ids= [ #Generate unique ids for each chunk based on source and index to avoid duplicates in the vector DB
         f"{chunk.metadata.get('source', 'unknown_source')}_{i}" 
@@ -146,7 +147,7 @@ if st.session_state.vectorstore is not None:
                 with st.spinner("Generating your answer..."):
                     retriever = st.session_state.vectorstore.as_retriever()
                     # multi query
-                    multi_template = """You are an AI language model assistant. Your task is to generate 1 - 5 different sub questions OR alternate versions of the given user question to retrieve relevant documents from a vector database.
+                    multi_template = """You are an AI language model assistant that helps answering questions about GregTech:NewHorizons. Your task is to generate 1 - 5 different sub questions OR alternate versions of the given user question to retrieve relevant documents from a vector database.
 
                                         By generating multiple versions of the user question,
                                         your goal is to help the user overcome some of the limitations
@@ -165,6 +166,7 @@ if st.session_state.vectorstore is not None:
                                         </questions>
 
                                         Original question: {question}"""
+                    
                     prompt_perspectives = ChatPromptTemplate.from_template(multi_template)
 
                     def parse_questions(text: str): #Parse the output of the multi query prompt to extract the generated questions, remove empty lines and the XML tags
@@ -182,45 +184,155 @@ if st.session_state.vectorstore is not None:
                         | StrOutputParser() 
                         | parse_questions
                     )
+                    llm = ChatOpenAI(model="gpt-5.4")
 
-                    def get_unique_union(documents: list[list]):
-                        #Union of retreived documents from multiple queries
-                        #Flatten the list of lists, and convert each documents to string
-                        flattened_docs = [dumps(doc) for sublist in documents for doc in sublist]
-                        #Get unique documents
-                        unique_docs = list(set(flattened_docs))
-                        #return documents in their original format
-                        return [loads(doc) for doc in unique_docs]
-                    #this chain will generate multiple queries from the original question, retreive documents for each query, and then make a union of all retreived documents to have a more complete context for the final answer generation
-                    retrieval_chain = generate_queries | retriever.map() | get_unique_union
+                    # RECURSIVE RAG DECOMPOSITON
+
+                    template = """Here is the question you need to answer:
+
+                                \n --- \n {question} \n --- \n
+
+                                Here is any available background question + answer pairs:
+
+                                \n --- \n {q_a_pairs} \n --- \n
+
+                                Here is additional context relevant to the question: 
+
+                                \n --- \n {context} \n --- \n
+
+                                Use the above context and any background question + answer pairs to answer the question: \n {question}
+                                """
+
+                    decomposition_prompt = ChatPromptTemplate.from_template(template)
+
+                    decompostion_chain = (
+                        decomposition_prompt
+                        | llm
+                        | StrOutputParser()
+                    )
+
+                    # RAG FUSION EXAMPLE
+                    
+                    def reciprocal_rank_fusion(results: list[list[Document]], k=60) -> list[Document]:
+                        """Reciprocal_rank_fusion taht takes multiple lists of ranked documents
+                            and an optional parameter k used in the RRF formula"""
+
+                        #Initialize a dictionary to store the scores for each document
+                        fused_scores = {}
+
+                        # Iterate trought each list of ranked documents
+                        for docs in results:
+                            # Iterate through each document in the list
+                            for rank, doc in enumerate(docs):
+                                #convert the doucment to a string format to use as a key
+                                doc_str = dumps(doc)
+                                #if the document is not yet in fused_score dictionary, add it with an initial score of 0
+                                if doc_str not in fused_scores:
+                                    fused_scores[doc_str] = 0
+                                #Retreive the current score of the document
+                                previous_score = fused_scores[doc_str]
+                                #Update the score of the document using the RRF formula: 1 / (rank + k)
+                                fused_scores[doc_str] += 1 / (rank + k)
+
+                        #Sort the documents based on their fused scores in descending order to get the final reranked result
+                        reranked_results = [
+                            loads(doc)
+                            for doc, _score in sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+                        ]
+
+                        return reranked_results
 
                     def format_docs(docs): #Format the retreived documents to have a better prompt for the final answer generation
                         return "\n\n".join(doc.page_content for doc in docs)
                     
-                    docs = retrieval_chain.invoke({"question": question})
-                    context = format_docs(docs)
+                    def format_qa_pair(question, answer):
+                        """Format Q and A pair"""
+                        return f"Question: {question}\nAnswer: {answer}"
 
+                    def recursively_answer(data:dict) -> dict:
+                        original_question = data["question"]
+
+                        #Parse_question, is executed inside generate_queries
+                        questions = generate_queries.invoke({
+                            "question": original_question
+                        })
+
+                        qa_pairs = []
+                        retrieved_results = []
+
+                        for subquestion in questions:
+                            #Retrieve documents specifically for this subquestion
+                            docs = retriever.invoke(subquestion)
+                            retrieved_results.append(docs)
+
+                            answer = decompostion_chain.invoke({
+                                "question": subquestion,
+                                "q_a_pairs": "\n\n---\n\n".join(qa_pairs),
+                                "context": format_docs(docs),
+                            })
+
+                            qa_pairs.append(
+                                format_qa_pair(subquestion, answer)
+                            )
+
+                        #Fuse documents retrieved for all subquestions
+                        fused_docs = reciprocal_rank_fusion(retrieved_results)
+
+                        return {
+                            "docs": fused_docs,
+                            "q_a_pairs": "\n\n---\n\n".join(qa_pairs),
+                        }
                     # Full rag chain with multiple queries and final answer generation
-                    template = """Answer the following question based on this context and the retrieved documents. If you don't know the answer, say you don't know. Be concise and precise in your answer.:
-
-                    {context}
-
-                    Question: {question}
-                    """
+                    template = """Answer the original question using the information below.
+        
+                                Original question:
+                                {question}
+                                
+                                Subquestion answers:
+                                {q_a_pairs}
+                                
+                                Retrieved context:
+                                {context}
+                                """
 
                     prompt= ChatPromptTemplate.from_template(template)
-                    llm = ChatOpenAI(model="gpt-5.4")
+
+                    def build_answer_input(data):
+                        recursive_result = data["recursive"]
+
+                        return {
+                            "question": data["question"],
+                            "context": format_docs(recursive_result["docs"]),
+                            "q_a_pairs": recursive_result["q_a_pairs"],
+                        }
                     
-                    final_rag_chain = ( 
-                        prompt
+                    answer_chain = (
+                        RunnableLambda(
+                            build_answer_input,
+                            name="format_answer_inputs",
+                        )
+                        | prompt
                         | llm
                         | StrOutputParser()
                     )
-                    
-                    response = final_rag_chain.invoke({"question": question, 
-                                                       "context": context
-                                                       })
 
+
+                    recursive_chain = RunnableLambda(recursively_answer)
+
+                    full_rag_chain = ( 
+                        #Adds retieved documents to the original input dictionnary
+                        RunnablePassthrough.assign(recursive=recursive_chain)
+                        #Uses those same documents to produce the answer
+                        | RunnablePassthrough.assign(answer=answer_chain)
+                    ).with_config({"run_name": "MultiQueryRAG"})
+                    
+                    result = full_rag_chain.invoke({
+                        "question": question,
+                    })
+
+                    response = result["answer"]
+                    docs = result["recursive"]["docs"]
+                    
                     st.session_state.last_response = response
                     st.session_state.last_context = docs
             else:
