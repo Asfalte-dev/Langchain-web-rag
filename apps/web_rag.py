@@ -211,7 +211,7 @@ if st.session_state.vectorstore is not None:
                         | StrOutputParser()
                     )
 
-                    # RAG FUSION
+                    # RAG FUSION EXAMPLE
                     
                     def reciprocal_rank_fusion(results: list[list[Document]], k=60) -> list[Document]:
                         """Reciprocal_rank_fusion taht takes multiple lists of ranked documents
